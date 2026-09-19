@@ -27,3 +27,11 @@ public class UpdateTodoDtoValidator : AbstractValidator<UpdateTodoDto>
         RuleFor(x => x.Priority).IsInEnum();
     }
 }
+
+public class CompleteTodoDtoValidator : AbstractValidator<CompleteTodoDto>
+{
+    public CompleteTodoDtoValidator()
+    {
+        RuleFor(x => x.Id).GreaterThan(0);
+    }
+}

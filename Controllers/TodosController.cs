@@ -21,30 +21,34 @@ public class TodosController : ControllerBase
     private readonly IMemoryCache _cache;
     private readonly IValidator<CreateTodoDto> _createValidator;
     private readonly IValidator<UpdateTodoDto> _updateValidator;
+    private readonly IValidator<CompleteTodoDto> _completeValidator;
 
     public TodosController(
         TodoDbContext context,
         IMemoryCache cache,
         IValidator<CreateTodoDto> createValidator,
-        IValidator<UpdateTodoDto> updateValidator)
+        IValidator<UpdateTodoDto> updateValidator,
+        IValidator<CompleteTodoDto> completeValidator)
     {
         _context = context;
         _cache = cache;
         _createValidator = createValidator;
         _updateValidator = updateValidator;
+        _completeValidator = completeValidator;
     }
 
     [HttpGet]
     public async Task<ActionResult<IEnumerable<TodoResponseDto>>> GetTodos(
         [FromQuery] TodoStatus? status,
-        [FromQuery] TodoPriority? priority)
+        [FromQuery] TodoPriority? priority,
+        CancellationToken cancellationToken)
     {
-        var cacheKey = $"todos:list:{status}:{priority}";
+        var cacheKey = ListCacheKey(status, priority);
 
         if (_cache.TryGetValue(cacheKey, out IEnumerable<TodoResponseDto>? cached))
             return Ok(cached);
 
-        var query = _context.TodoItems.AsQueryable();
+        var query = _context.TodoItems.AsNoTracking().AsQueryable();
 
         if (status.HasValue)
             query = query.Where(t => t.Status == status.Value);
@@ -52,8 +56,12 @@ public class TodosController : ControllerBase
         if (priority.HasValue)
             query = query.Where(t => t.Priority == priority.Value);
 
-        var todos = await query.OrderByDescending(t => t.CreatedAt).ToListAsync();
-        var result = todos.Select(ToDto).ToList();
+        var result = await query
+            .OrderByDescending(t => t.CreatedAt)
+            .Select(t => new TodoResponseDto(
+                t.Id, t.Title, t.Description, t.Status, t.Priority, t.CreatedAt, t.DueDate,
+                t.IsCompleted, t.CompletedAt))
+            .ToListAsync(cancellationToken);
 
         _cache.Set(cacheKey, result, new MemoryCacheEntryOptions
         {
@@ -65,14 +73,15 @@ public class TodosController : ControllerBase
     }
 
     [HttpGet("{id:int}")]
-    public async Task<ActionResult<TodoResponseDto>> GetTodo(int id)
+    public async Task<ActionResult<TodoResponseDto>> GetTodo(int id, CancellationToken cancellationToken)
     {
-        var cacheKey = $"todos:{id}";
+        var cacheKey = ItemCacheKey(id);
 
         if (_cache.TryGetValue(cacheKey, out TodoResponseDto? cached))
             return Ok(cached);
 
-        var todo = await _context.TodoItems.FindAsync(id);
+        var todo = await _context.TodoItems.AsNoTracking()
+            .FirstOrDefaultAsync(t => t.Id == id, cancellationToken);
         if (todo is null)
             return NotFound();
 
@@ -83,11 +92,10 @@ public class TodosController : ControllerBase
     }
 
     [HttpPost]
-    public async Task<ActionResult<TodoResponseDto>> CreateTodo(CreateTodoDto dto)
+    public async Task<ActionResult<TodoResponseDto>> CreateTodo(CreateTodoDto dto, CancellationToken cancellationToken)
     {
-        var validation = await _createValidator.ValidateAsync(dto);
-        if (!validation.IsValid)
-            return ValidationProblem(AddErrors(validation));
+        if (await ValidateAsync(_createValidator, dto) is { } problem)
+            return problem;
 
         var todo = new TodoItem
         {
@@ -100,20 +108,19 @@ public class TodosController : ControllerBase
         };
 
         _context.TodoItems.Add(todo);
-        await _context.SaveChangesAsync();
+        await _context.SaveChangesAsync(cancellationToken);
         InvalidateListCache();
 
         return CreatedAtAction(nameof(GetTodo), new { id = todo.Id }, ToDto(todo));
     }
 
     [HttpPut("{id:int}")]
-    public async Task<IActionResult> UpdateTodo(int id, UpdateTodoDto dto)
+    public async Task<IActionResult> UpdateTodo(int id, UpdateTodoDto dto, CancellationToken cancellationToken)
     {
-        var validation = await _updateValidator.ValidateAsync(dto);
-        if (!validation.IsValid)
-            return ValidationProblem(AddErrors(validation));
+        if (await ValidateAsync(_updateValidator, dto) is { } problem)
+            return problem;
 
-        var todo = await _context.TodoItems.FindAsync(id);
+        var todo = await _context.TodoItems.FindAsync(new object[] { id }, cancellationToken);
         if (todo is null)
             return NotFound();
 
@@ -123,26 +130,56 @@ public class TodosController : ControllerBase
         todo.Priority = dto.Priority;
         todo.DueDate = dto.DueDate;
 
-        await _context.SaveChangesAsync();
-        _cache.Remove($"todos:{id}");
+        await _context.SaveChangesAsync(cancellationToken);
+        _cache.Remove(ItemCacheKey(id));
         InvalidateListCache();
 
         return NoContent();
     }
 
-    [HttpDelete("{id:int}")]
-    public async Task<IActionResult> DeleteTodo(int id)
+    [HttpPatch("{id:int}/complete")]
+    public async Task<ActionResult<TodoResponseDto>> CompleteTodo(int id, CancellationToken cancellationToken)
     {
-        var todo = await _context.TodoItems.FindAsync(id);
+        if (await ValidateAsync(_completeValidator, new CompleteTodoDto(id)) is { } problem)
+            return problem;
+
+        var todo = await _context.TodoItems.FindAsync(new object[] { id }, cancellationToken);
+        if (todo is null)
+            return NotFound();
+
+        todo.IsCompleted = true;
+        todo.CompletedAt = DateTime.UtcNow;
+
+        await _context.SaveChangesAsync(cancellationToken);
+        _cache.Remove(ItemCacheKey(id));
+        InvalidateListCache();
+
+        return Ok(ToDto(todo));
+    }
+
+    [HttpDelete("{id:int}")]
+    public async Task<IActionResult> DeleteTodo(int id, CancellationToken cancellationToken)
+    {
+        var todo = await _context.TodoItems.FindAsync(new object[] { id }, cancellationToken);
         if (todo is null)
             return NotFound();
 
         _context.TodoItems.Remove(todo);
-        await _context.SaveChangesAsync();
-        _cache.Remove($"todos:{id}");
+        await _context.SaveChangesAsync(cancellationToken);
+        _cache.Remove(ItemCacheKey(id));
         InvalidateListCache();
 
         return NoContent();
+    }
+
+    private static string ListCacheKey(TodoStatus? status, TodoPriority? priority) => $"todos:list:{status}:{priority}";
+
+    private static string ItemCacheKey(int id) => $"todos:{id}";
+
+    private async Task<ActionResult?> ValidateAsync<T>(IValidator<T> validator, T dto)
+    {
+        var validation = await validator.ValidateAsync(dto);
+        return validation.IsValid ? null : ValidationProblem(AddErrors(validation));
     }
 
     private CancellationTokenSource GetListCacheTokenSource()
@@ -166,7 +203,8 @@ public class TodosController : ControllerBase
     }
 
     private static TodoResponseDto ToDto(TodoItem todo) => new(
-        todo.Id, todo.Title, todo.Description, todo.Status, todo.Priority, todo.CreatedAt, todo.DueDate);
+        todo.Id, todo.Title, todo.Description, todo.Status, todo.Priority, todo.CreatedAt, todo.DueDate,
+        todo.IsCompleted, todo.CompletedAt);
 
     private ModelStateDictionary AddErrors(FluentValidation.Results.ValidationResult validation)
     {

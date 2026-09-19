@@ -7,6 +7,13 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <Compile Remove="TodoApi.Tests/**" />
+    <Content Remove="TodoApi.Tests/**" />
+    <EmbeddedResource Remove="TodoApi.Tests/**" />
+    <None Remove="TodoApi.Tests/**" />
+  </ItemGroup>
+
+  <ItemGroup>
     <PackageReference Include="FluentValidation" Version="12.0.0" />
     <PackageReference Include="FluentValidation.DependencyInjectionExtensions" Version="12.0.0" />
     <PackageReference Include="Microsoft.AspNetCore.OpenApi" Version="10.0.12" />

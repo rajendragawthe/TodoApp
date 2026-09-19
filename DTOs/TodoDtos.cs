@@ -23,4 +23,8 @@ public record TodoResponseDto(
     TodoStatus Status,
     TodoPriority Priority,
     DateTime CreatedAt,
-    DateTime? DueDate);
+    DateTime? DueDate,
+    bool IsCompleted,
+    DateTime? CompletedAt);
+
+public record CompleteTodoDto(int Id);

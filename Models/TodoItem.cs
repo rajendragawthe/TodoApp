@@ -23,4 +23,6 @@ public class TodoItem
     public TodoPriority Priority { get; set; } = TodoPriority.Medium;
     public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
     public DateTime? DueDate { get; set; }
+    public bool IsCompleted { get; set; }
+    public DateTime? CompletedAt { get; set; }
 }
