@@ -2,6 +2,8 @@ using FluentValidation;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.Mvc.ModelBinding;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Caching.Memory;
+using Microsoft.Extensions.Primitives;
 using TodoApi.Data;
 using TodoApi.DTOs;
 using TodoApi.Models;
@@ -12,16 +14,22 @@ namespace TodoApi.Controllers;
 [Route("api/[controller]")]
 public class TodosController : ControllerBase
 {
+    private static readonly TimeSpan CacheDuration = TimeSpan.FromMinutes(5);
+    private const string ListCacheTokenKey = "todos:list-token";
+
     private readonly TodoDbContext _context;
+    private readonly IMemoryCache _cache;
     private readonly IValidator<CreateTodoDto> _createValidator;
     private readonly IValidator<UpdateTodoDto> _updateValidator;
 
     public TodosController(
         TodoDbContext context,
+        IMemoryCache cache,
         IValidator<CreateTodoDto> createValidator,
         IValidator<UpdateTodoDto> updateValidator)
     {
         _context = context;
+        _cache = cache;
         _createValidator = createValidator;
         _updateValidator = updateValidator;
     }
@@ -31,6 +39,11 @@ public class TodosController : ControllerBase
         [FromQuery] TodoStatus? status,
         [FromQuery] TodoPriority? priority)
     {
+        var cacheKey = $"todos:list:{status}:{priority}";
+
+        if (_cache.TryGetValue(cacheKey, out IEnumerable<TodoResponseDto>? cached))
+            return Ok(cached);
+
         var query = _context.TodoItems.AsQueryable();
 
         if (status.HasValue)
@@ -40,17 +53,33 @@ public class TodosController : ControllerBase
             query = query.Where(t => t.Priority == priority.Value);
 
         var todos = await query.OrderByDescending(t => t.CreatedAt).ToListAsync();
-        return Ok(todos.Select(ToDto));
+        var result = todos.Select(ToDto).ToList();
+
+        _cache.Set(cacheKey, result, new MemoryCacheEntryOptions
+        {
+            AbsoluteExpirationRelativeToNow = CacheDuration,
+            ExpirationTokens = { new CancellationChangeToken(GetListCacheTokenSource().Token) }
+        });
+
+        return Ok(result);
     }
 
     [HttpGet("{id:int}")]
     public async Task<ActionResult<TodoResponseDto>> GetTodo(int id)
     {
+        var cacheKey = $"todos:{id}";
+
+        if (_cache.TryGetValue(cacheKey, out TodoResponseDto? cached))
+            return Ok(cached);
+
         var todo = await _context.TodoItems.FindAsync(id);
         if (todo is null)
             return NotFound();
 
-        return Ok(ToDto(todo));
+        var result = ToDto(todo);
+        _cache.Set(cacheKey, result, CacheDuration);
+
+        return Ok(result);
     }
 
     [HttpPost]
@@ -72,6 +101,7 @@ public class TodosController : ControllerBase
 
         _context.TodoItems.Add(todo);
         await _context.SaveChangesAsync();
+        InvalidateListCache();
 
         return CreatedAtAction(nameof(GetTodo), new { id = todo.Id }, ToDto(todo));
     }
@@ -94,6 +124,9 @@ public class TodosController : ControllerBase
         todo.DueDate = dto.DueDate;
 
         await _context.SaveChangesAsync();
+        _cache.Remove($"todos:{id}");
+        InvalidateListCache();
+
         return NoContent();
     }
 
@@ -106,7 +139,30 @@ public class TodosController : ControllerBase
 
         _context.TodoItems.Remove(todo);
         await _context.SaveChangesAsync();
+        _cache.Remove($"todos:{id}");
+        InvalidateListCache();
+
         return NoContent();
+    }
+
+    private CancellationTokenSource GetListCacheTokenSource()
+    {
+        return _cache.GetOrCreate(ListCacheTokenKey, entry =>
+        {
+            entry.SetPriority(CacheItemPriority.NeverRemove);
+            return new CancellationTokenSource();
+        })!;
+    }
+
+    private void InvalidateListCache()
+    {
+        if (_cache.TryGetValue(ListCacheTokenKey, out CancellationTokenSource? cts))
+        {
+            cts?.Cancel();
+            cts?.Dispose();
+        }
+
+        _cache.Remove(ListCacheTokenKey);
     }
 
     private static TodoResponseDto ToDto(TodoItem todo) => new(
